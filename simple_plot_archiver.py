@@ -1,5 +1,10 @@
+#### This is still under development don't use this code!
+#### Plots are being partially copied and it may ruin your hard work.
+
 import argparse
+import hashlib
 import logging
+import os
 import shutil
 import time
 
@@ -8,9 +13,11 @@ from queue import Queue
 from threading import Thread, Lock
 
 log = logging.getLogger(__name__)
+log.setLevel(logging.NOTSET)
+logging.basicConfig(filename="./simple_plot_archiver_logs.log", level=logging.NOTSET)
 
 K = 32
-WORKER_DAEMON_THREADS = 2
+WORKER_DAEMON_THREADS = 1
 RUN_WORKER_DAEMON = True
 
 thread_dest_dir_lst = []
@@ -55,21 +62,28 @@ def worker_daemon(source_dir, conf, thread_num):
         #######################
         lock.acquire()
 
-        drives_full = False
+        idx_chosen = False
+        drives_full = True
         # Get the next available index with free space
-        for j in range(0, len(dest_dirs)):
+        i = 0
+        while i < len(dest_dirs) and drives_full is True:
             d_idx += 1
             if d_idx >= len(dest_dirs):
                 d_idx = 0
             if space_available(dest_dirs[d_idx]):
-                break
-            if j == len(dest_dirs) - 1:
-                log.warning("No drives with enough free space found!")
-                drives_full = True
+                drives_full = False
+                idx_chosen = True
+
+        if drives_full:
+            log.warning(f"No drives with enough free space found! Thread: {thread_num}")
+            time.sleep(1)
+            lock.release()
+            continue
 
         # Chosen index is already being used, find an index to a destination directory
         # without a file going on
-        if drives_full is False and dest_dirs[d_idx] in thread_dest_dir_lst:
+        if dest_dirs[d_idx] in thread_dest_dir_lst:
+            idx_chosen = True
             matching_idxs = []
             for thr_d_dir in thread_dest_dir_lst:
                 for d_idx, d_dir in enumerate(dest_dirs):
@@ -83,38 +97,49 @@ def worker_daemon(source_dir, conf, thread_num):
             # in the list of directories that are already in use
             valid_idxs = list(set(dest_dir_idxs) - set(matching_idxs))
 
-            idx_chosen = False
             for v_idx in valid_idxs:
                 free_space = space_available(dest_dirs[v_idx])
                 if free_space:
                     idx_chosen = True
                     d_idx = v_idx
                     break
-            if idx_chosen is False:
-                # We dont need to stop the process just let the user know
-                log.warning("No drives with enough free space found!")
+
+        if idx_chosen is False:
+            # We dont need to stop the process just let the user know
+            log.warning(f"No drives with enough free space found! Thread: {thread_num}")
+            time.sleep(1)
+            lock.release()
+            continue
 
         thread_dest_dir_lst[thread_num] = dest_dirs[d_idx]
 
         # Look in the source directory for plots of the correct k value and
         # without .tmp ending and with the .plot ending
         plot_found = False
-        for plot_path in plot_src.iterdir():
-            basename = str(plot_path.name).lower()
-            abs_path = str(plot_path.absolute())
-            if "tmp" not in basename and basename.endswith(".plot"):
-                # Check that plot is of the correct k type
-                k_val = None
-                for k in ["k32", "k33", "k34", "k35"]:
-                    if k in basename[:10]:
-                        k_val = int(k[1:])
+        plot_lst = [x for x in plot_src.iterdir()]
+        plot_lst = list(filter(lambda x: "plot" in x.name, plot_lst))
+        if len(plot_lst) > 0:
+            for plot_path in plot_lst:
+                basename = str(plot_path.name).lower()
+                abs_path = str(plot_path.absolute())
+                if "tmp" not in basename and basename.endswith(".plot"):
+                    # Check that plot is of the correct k type
+                    k_val = None
+                    for k in ["k32", "k33", "k34", "k35"]:
+                        if k in basename[:10]:
+                            k_val = int(k[1:])
 
-                if not k_val:
-                    log.error(f"Unable to discern plot k value: {abs_path}")
-                elif abs_path not in thread_plot_lst and k_val == K:
-                    plot_found = True
-                    thread_plot_lst[thread_num] = abs_path
-                    break
+                    # check plot size
+                    plt_size_b = plot_path.stat().st_size
+                    # Out of 107 plots 108758287484 was the min size 108943399155 the max
+                    if plt_size_b < 108700000000:
+                        log.error(f"Plot is of incorrect size: {abs_path}")
+                    elif not k_val:
+                        log.error(f"Unable to discern plot k value: {abs_path}")
+                    elif abs_path not in thread_plot_lst and k_val == K:
+                        plot_found = True
+                        thread_plot_lst[thread_num] = abs_path
+                        break
 
         #######################
         # Done with unsafe code
@@ -123,6 +148,7 @@ def worker_daemon(source_dir, conf, thread_num):
 
         if plot_found is False:
             # Sleep for a bit in case there are no files to transfer
+            log.warning(f"No plots found in {str(plot_src)}")
             time.sleep(1)
             continue
 
@@ -138,8 +164,28 @@ def worker_daemon(source_dir, conf, thread_num):
             log.error(f"Destination directory invalid: {dst}")
             continue
 
-        shutil.move(thread_plot_lst[thread_num], thread_dest_dir_lst[thread_num])
-        log.info(f"Moved {str(src.name)} to {thread_dest_dir_lst[thread_num]}")
+        log.info(f"Moving {str(src.name)} to {str(dst)}")
+        print(f"Moving {str(src.name)} to {str(dst)}")
+
+        copy_complete = False
+        i = 0
+        while (copy_complete is False or i < 5):
+#            os.system(f"cp {thread_plot_lst[thread_num]} {thread_dest_dir_lst[thread_num]}") # Not OS agnostic
+             time.sleep(15) # Sleep for 15 seconds just to make sure any io is done on the file
+             shutil.copy2(src, dst, follow_symlinks=False)
+
+             src_md5 = hashlib.md5(str(src).encode()).hexdigest()
+             dst_md5 = hashlib.md5(str(dst).encode()).hexdigest()
+             if (src_md5 == dst_md5):
+                 copy_complete = True
+                 src_md5.unlink(missing_ok=True) # Safe to delete the old plot
+             else:
+                 log.info(f"Unable to move {str(src.name)} to {str(dst)} SOMETHING IS VERY WRONG!")
+                 dst_md5.unlink(missing_ok=True) # Delete and try again
+             i += 1
+
+
+        log.info(f"Moved {str(src.name)} to {str(dst)}")
 
         thread_dest_dir_lst[thread_num] = ""
         thread_plot_lst[thread_num] = ""
@@ -185,7 +231,7 @@ def main():
         threads.append(t)
 
     for thread in threads:
-        thread.join()
+        thread.join(timeout=None)
 
 
 if __name__ == "__main__":
